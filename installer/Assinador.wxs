@@ -1,0 +1,70 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Assinador para WhatsApp" Manufacturer="Assinador" Version="0.1.3"
+           UpgradeCode="7F7D96B0-1B82-40F3-BD11-57F9EB4C4F30" Scope="perUser" Language="1046">
+    <MajorUpgrade DowngradeErrorMessage="Já existe uma versão mais recente do Assinador instalada." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Icon Id="Caneca" SourceFile="$(sys.SOURCEFILEDIR)..\assets\caneca.ico" />
+    <Property Id="ARPPRODUCTICON" Value="Caneca" />
+    <EnsureTable Id="ControlCondition" />
+    <UIRef Id="WixUI_Common" />
+    <UI>
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="9" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Segoe UI" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Segoe UI" Size="10" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="UserExit" />
+      <Dialog Id="InstallComplete" Width="286" Height="112" Title="Assinador para WhatsApp" NoMinimize="yes">
+        <Control Id="Message" Type="Text" X="18" Y="20" Width="248" Height="36"
+                 Text="Instalação concluída com sucesso. Abra o Assinador para WhatsApp pelo menu Iniciar." />
+        <Control Id="Finish" Type="PushButton" X="209" Y="80" Width="59" Height="18"
+                 Default="yes" Cancel="yes" Text="Concluir">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+      <InstallUISequence>
+        <Show Dialog="InstallComplete" OnExit="success" Condition="NOT REMOVE" />
+      </InstallUISequence>
+      <AdminUISequence>
+        <Show Dialog="InstallComplete" OnExit="success" />
+      </AdminUISequence>
+    </UI>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="Assinador para WhatsApp">
+        <Component Id="AppFiles" Guid="4BBB6651-E796-4347-AF66-1441BCF3DA68">
+          <File Id="AppExe" Name="AssinadorWhatsApp.exe" Source="$(var.AppExe)" />
+          <RegistryValue Root="HKCU" Key="Software\AssinadorWhatsApp" Name="InstallPath"
+                         Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="24F38F8E-AF32-4634-A30E-B750E53F09D0">
+        <Shortcut Id="StartMenuLink" Name="Assinador para WhatsApp" Target="[INSTALLFOLDER]AssinadorWhatsApp.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="Caneca" />
+        <RegistryValue Root="HKCU" Key="Software\AssinadorWhatsApp" Name="StartMenu"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+    <StandardDirectory Id="StartupFolder">
+      <Component Id="StartupShortcut" Guid="DEEFB948-C36C-41F8-A1B8-EAF74A9F6FD2">
+        <Shortcut Id="StartupLink" Name="Assinador para WhatsApp" Target="[INSTALLFOLDER]AssinadorWhatsApp.exe"
+                  WorkingDirectory="INSTALLFOLDER" Arguments="--background" />
+        <RegistryValue Root="HKCU" Key="Software\AssinadorWhatsApp" Name="Startup"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="ProductFeature" Title="Assinador para WhatsApp">
+      <ComponentRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="StartupShortcut" />
+    </Feature>
+  </Package>
+</Wix>
