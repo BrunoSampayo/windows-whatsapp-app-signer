@@ -1,5 +1,5 @@
 use crate::{
-    profiles::{MAX_NAME, MAX_PROFILES, Profiles},
+    profiles::{Client, MAX_NAME, MAX_PROFILES, Profiles},
     signing::Signing,
 };
 use std::{
@@ -37,6 +37,7 @@ const SELECT: usize = 104;
 const MANAGE: usize = 105;
 const PAUSE: usize = 106;
 const EXIT: usize = 107;
+const CLIENT: usize = 108;
 const PROFILE_BASE: usize = 200;
 const ICON_FILE: &[u8] = include_bytes!("../assets/caneca.ico");
 #[repr(align(4))]
@@ -48,6 +49,7 @@ struct App {
     edit: HWND,
     list: HWND,
     status: HWND,
+    client: HWND,
     profiles: Profiles,
     signing: Signing,
     automation_available: bool,
@@ -111,20 +113,44 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             scale(490),
-            scale(350),
+            scale(390),
             None,
             None,
             Some(instance),
             None,
         )?;
         let status = control(hwnd, w!("STATIC"), w!(""), 0, WS_VISIBLE, [20, 20, 430, 24])?;
+        control(
+            hwnd,
+            w!("STATIC"),
+            w!("Versão do WhatsApp"),
+            0,
+            WS_VISIBLE,
+            [20, 53, 140, 23],
+        )?;
+        let client = control(
+            hwnd,
+            w!("COMBOBOX"),
+            w!(""),
+            CLIENT,
+            WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+            [162, 49, 288, 110],
+        )?;
+        for label in [w!("Aplicativo do Windows"), w!("Navegador (WhatsApp Web)")] {
+            SendMessageW(
+                client,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(label.as_ptr() as isize)),
+            );
+        }
         let list = control(
             hwnd,
             w!("LISTBOX"),
             w!(""),
             LIST,
             WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
-            [20, 52, 430, 128],
+            [20, 92, 430, 128],
         )?;
         control(
             hwnd,
@@ -132,7 +158,7 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             w!("Nome"),
             0,
             WS_VISIBLE,
-            [20, 196, 58, 23],
+            [20, 236, 58, 23],
         )?;
         let edit = control(
             hwnd,
@@ -140,7 +166,7 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             w!(""),
             0,
             WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            [82, 193, 368, 26],
+            [82, 233, 368, 26],
         )?;
         SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(MAX_NAME)), None);
         for (label, id, x, width) in [
@@ -155,7 +181,7 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
                 label,
                 id,
                 WS_VISIBLE | WS_TABSTOP,
-                [x, 238, width, 29],
+                [x, 278, width, 29],
             )?;
         }
         let hotkey = RegisterHotKey(
@@ -175,7 +201,7 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             footer,
             0,
             WS_VISIBLE,
-            [20, 282, 430, 22],
+            [20, 322, 430, 22],
         )?;
         let signing = Signing::start()?;
         let app = App {
@@ -183,6 +209,7 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             edit,
             list,
             status,
+            client,
             profiles,
             signing,
             icon,
@@ -317,7 +344,9 @@ impl App {
     }
 
     fn refresh(&self, selection: Option<usize>) {
-        self.signing.set_name(self.profiles.signing_name());
+        self.signing
+            .set_preferences(self.profiles.signing_name(), self.profiles.client);
+        self.refresh_client();
         unsafe {
             let _ = SetWindowTextW(self.status, PCWSTR(wide(&self.status_text()).as_ptr()));
             SendMessageW(self.list, LB_RESETCONTENT, None, None);
@@ -339,6 +368,17 @@ impl App {
             }
         }
         self.notify(NIM_MODIFY);
+    }
+
+    fn refresh_client(&self) {
+        unsafe {
+            SendMessageW(
+                self.client,
+                CB_SETCURSEL,
+                Some(WPARAM(usize::from(self.profiles.client == Client::Web))),
+                None,
+            );
+        }
     }
 
     fn selected(&self) -> Option<usize> {
@@ -382,6 +422,17 @@ impl App {
                 selection = Some(next.active);
             }
             SELECT => next.active = needs_selection()?,
+            CLIENT => {
+                next.client = match unsafe { SendMessageW(self.client, CB_GETCURSEL, None, None).0 }
+                {
+                    0 => Client::Desktop,
+                    1 => Client::Web,
+                    _ => return Ok(()),
+                };
+                if next.client == self.profiles.client {
+                    return Ok(());
+                }
+            }
             PAUSE => next.paused = !next.paused,
             id if (PROFILE_BASE..PROFILE_BASE + next.names.len()).contains(&id) => {
                 next.active = id - PROFILE_BASE;
@@ -390,8 +441,12 @@ impl App {
             }
             _ => return Ok(()),
         }
-        next.save()
-            .map_err(|error| format!("Não foi possível salvar os nomes.\n\n{error}"))?;
+        if let Err(error) = next.save() {
+            self.refresh_client();
+            return Err(format!(
+                "Não foi possível salvar as preferências.\n\n{error}"
+            ));
+        }
         self.profiles = next;
         if matches!(command, ADD | RENAME) {
             unsafe {
@@ -487,7 +542,9 @@ unsafe extern "system" fn window_proc(
             },
             WM_COMMAND
                 if wparam.0 >> 16 == 0
-                    || (wparam.0 & 0xffff == LIST && wparam.0 >> 16 == LBN_DBLCLK as usize) =>
+                    || (wparam.0 & 0xffff == LIST && wparam.0 >> 16 == LBN_DBLCLK as usize)
+                    || (wparam.0 & 0xffff == CLIENT
+                        && wparam.0 >> 16 == CBN_SELCHANGE as usize) =>
             {
                 let mut id = wparam.0 & 0xffff;
                 if id == LIST {

@@ -1,9 +1,10 @@
-use crate::profiles::{has_signature_line, prefix_for_draft};
+use crate::profiles::{Client, has_signature_line, prefix_for_draft};
 use std::{
     cell::RefCell,
     mem::ManuallyDrop,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::{Duration, Instant},
@@ -31,7 +32,12 @@ const COMPOSER_NAMES: &[&str] = &[
     "type your message",
 ];
 const SEND_NAMES: &[&str] = &["Enviar", "Enviar mensagem", "Send", "Send message"];
-const VOICE_NAMES: &[&str] = &["Mensagem de voz", "Voice message"];
+const VOICE_NAMES: &[&str] = &[
+    "Mensagem de voz",
+    "Gravar mensagem de voz",
+    "Voice message",
+    "Record voice message",
+];
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -43,6 +49,7 @@ enum Action {
 struct Request {
     id: u64,
     window: usize,
+    client: Client,
     action: Action,
     name: String,
     expires: Instant,
@@ -55,6 +62,8 @@ type ClickLocation = Arc<Mutex<Option<(usize, POINT)>>>;
 #[derive(Default)]
 struct Target {
     window: usize,
+    client: Client,
+    composer_focused: bool,
     buttons: Vec<RECT>,
     voice_slot: Vec<RECT>,
 }
@@ -80,6 +89,8 @@ pub struct Signing {
 struct State {
     requests: Sender<Request>,
     name: Option<String>,
+    client: Client,
+    web_enabled: Arc<AtomicBool>,
     target: Target,
     foreground: usize,
     whatsapp: bool,
@@ -101,9 +112,19 @@ impl Signing {
         let (outbox, events) = mpsc::channel();
         let last_click = ClickLocation::default();
         let worker_hint = Arc::clone(&last_click);
+        let web_enabled = Arc::new(AtomicBool::new(false));
+        let worker_web_enabled = Arc::clone(&web_enabled);
         std::thread::spawn(move || {
-            if with_automation(|automation| monitor(automation, inbox, &outbox, &worker_hint))
-                .is_err()
+            if with_automation(|automation| {
+                monitor(
+                    automation,
+                    inbox,
+                    &outbox,
+                    &worker_hint,
+                    &worker_web_enabled,
+                )
+            })
+            .is_err()
             {
                 let _ = outbox.send(Event::Unavailable);
             }
@@ -121,6 +142,8 @@ impl Signing {
         STATE.replace(Some(State {
             requests,
             name: None,
+            client: Client::Desktop,
+            web_enabled,
             target: Target::default(),
             foreground: 0,
             whatsapp: false,
@@ -138,10 +161,21 @@ impl Signing {
         })
     }
 
-    pub fn set_name(&self, name: Option<&str>) {
+    pub fn set_preferences(&self, name: Option<&str>, client: Client) {
         STATE.with_borrow_mut(|state| {
             if let Some(state) = state {
                 state.name = name.map(str::to_owned);
+                if state.client != client {
+                    state.client = client;
+                    state
+                        .web_enabled
+                        .store(client == Client::Web, Ordering::Relaxed);
+                    state.foreground = 0;
+                    state.whatsapp = false;
+                    state.target = Target::default();
+                    state.pending = None;
+                    state.last_edit = None;
+                }
             }
         });
     }
@@ -154,13 +188,20 @@ impl Signing {
             let window = foreground();
             if window != state.foreground {
                 state.foreground = window;
-                state.whatsapp = window != 0 && is_whatsapp(window);
+                state.whatsapp =
+                    state.client == Client::Desktop && window != 0 && is_whatsapp(window);
                 state.last_edit = None;
             }
             for event in self.events.try_iter() {
                 match event {
                     Event::Target(mut target) => {
-                        if target.window == state.target.window && target.voice_slot.is_empty() {
+                        if target.client != state.client || target.window != window {
+                            continue;
+                        }
+                        if target.window == state.target.window
+                            && target.voice_slot.is_empty()
+                            && (target.client == Client::Desktop || target.composer_focused)
+                        {
                             target.voice_slot = std::mem::take(&mut state.target.voice_slot);
                         }
                         state.target = target;
@@ -186,11 +227,12 @@ impl Signing {
                 .is_some_and(|request| Instant::now() >= request.expires)
             {
                 dispatch = state.pending.take().map(|request| {
-                    let decision = if request.confirm_prefix.is_some() {
-                        Decision::Stop
-                    } else {
-                        Decision::Pass
-                    };
+                    let decision =
+                        if request.confirm_prefix.is_some() || request.client == Client::Web {
+                            Decision::Stop
+                        } else {
+                            Decision::Pass
+                        };
                     (request, decision)
                 });
             }
@@ -233,6 +275,19 @@ impl Drop for Signing {
 }
 
 impl State {
+    fn accepts_input(&self, window: usize) -> bool {
+        window != 0
+            && window == self.foreground
+            && match self.client {
+                Client::Desktop => self.whatsapp,
+                Client::Web => {
+                    self.target.client == Client::Web
+                        && self.target.window == window
+                        && self.target.composer_focused
+                }
+            }
+    }
+
     fn request(&mut self, window: usize, action: Action) -> bool {
         let Some(name) = self.name.clone() else {
             return false;
@@ -244,6 +299,7 @@ impl State {
         let request = Request {
             id: self.next_id,
             window,
+            client: self.client,
             action,
             name,
             expires: Instant::now() + TIMEOUT,
@@ -271,8 +327,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w: WPARAM, l: LPARAM) -> LRES
         {
             STATE.with_borrow_mut(|state| {
                 if let Some(state) = state
-                    && state.whatsapp
-                    && state.foreground == foreground()
+                    && state.accepts_input(foreground())
                 {
                     state.last_edit = Some(Instant::now());
                 }
@@ -291,7 +346,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w: WPARAM, l: LPARAM) -> LRES
                             return true;
                         }
                         let window = foreground();
-                        if !state.whatsapp || state.foreground != window {
+                        if !state.accepts_input(window) {
                             return false;
                         }
                         state.enter_down = state.request(
@@ -338,12 +393,7 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
                     }
                     return true;
                 }
-                if state.name.is_none()
-                    || window == 0
-                    || window != state.foreground
-                    || !state.whatsapp
-                    || modifiers_pressed()
-                {
+                if state.name.is_none() || !state.accepts_input(window) || modifiers_pressed() {
                     return false;
                 }
                 let target = (state.target.window == window).then_some(&state.target);
@@ -519,10 +569,12 @@ fn monitor(
     inbox: Receiver<Request>,
     outbox: &Sender<Event>,
     last_click: &ClickLocation,
+    web_enabled: &AtomicBool,
 ) -> windows::core::Result<()> {
     let (focused_edit, send_or_voice) = control_conditions(automation)?;
     let mut editor = None;
     let mut editor_window = 0;
+    let mut editor_client = Client::Desktop;
     loop {
         let request = match inbox.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => Some(request),
@@ -530,14 +582,30 @@ fn monitor(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let window = foreground();
-        if window != editor_window {
+        let client = if web_enabled.load(Ordering::Relaxed) {
+            Client::Web
+        } else {
+            Client::Desktop
+        };
+        if window != editor_window || client != editor_client {
             editor = None;
             editor_window = window;
+            editor_client = client;
         }
         let event = if let Some(request) = request {
-            let can_read =
-                window == request.window && Instant::now() < request.expires && is_whatsapp(window);
-            let decision = if let Some(prefix) = &request.confirm_prefix {
+            let current = window == request.window
+                && client == request.client
+                && Instant::now() < request.expires;
+            let can_read = current && client == Client::Desktop && is_whatsapp(window);
+            let decision = if request.client == Client::Web {
+                if current {
+                    web_composer(automation, window).map_or(Decision::Stop, |editor| {
+                        decide_web(automation, &request, &editor, &send_or_voice)
+                    })
+                } else {
+                    Decision::Stop
+                }
+            } else if let Some(prefix) = &request.confirm_prefix {
                 if can_read
                     && editor
                         .as_ref()
@@ -565,7 +633,9 @@ fn monitor(
                 decision,
             }
         } else {
-            if window != 0 && is_whatsapp(window) {
+            if client == Client::Web {
+                editor = web_composer(automation, window);
+            } else if window != 0 && is_whatsapp(window) {
                 editor = editor
                     .filter(|editor| is_composer(editor, window).unwrap_or(false))
                     .or_else(|| {
@@ -592,6 +662,8 @@ fn monitor(
             }
             Event::Target(Target {
                 window,
+                client,
+                composer_focused: editor.is_some(),
                 buttons,
                 voice_slot,
             })
@@ -601,6 +673,51 @@ fn monitor(
         }
     }
     Ok(())
+}
+
+fn is_whatsapp_web_url(url: &str) -> bool {
+    url.split_once("://").is_some_and(|(scheme, rest)| {
+        scheme.eq_ignore_ascii_case("https")
+            && rest
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|host| host.eq_ignore_ascii_case("web.whatsapp.com"))
+    })
+}
+
+fn web_composer(automation: &IUIAutomation, window: usize) -> Option<IUIAutomationElement> {
+    unsafe {
+        let mut class = [0u16; 32];
+        let len = GetClassNameW(window_handle(window), &mut class).max(0) as usize;
+        if String::from_utf16_lossy(&class[..len]) != "Chrome_WidgetWin_1" {
+            return None;
+        }
+        let editor = automation.GetFocusedElement().ok()?;
+        if !live_composer(&editor, window) {
+            return None;
+        }
+        // Read the loaded document's URL. The address bar can contain uncommitted text.
+        let walker = automation.ControlViewWalker().ok()?;
+        let mut ancestor = editor.clone();
+        for _ in 0..20 {
+            ancestor = walker.GetParentElement(&ancestor).ok()?;
+            if ancestor.CurrentControlType().ok()? == UIA_DocumentControlTypeId {
+                let url = ancestor
+                    .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                    .and_then(|pattern| pattern.CurrentValue())
+                    .or_else(|_| {
+                        ancestor
+                            .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                                UIA_LegacyIAccessiblePatternId,
+                            )?
+                            .CurrentValue()
+                    })
+                    .ok()?;
+                return is_whatsapp_web_url(&url.to_string()).then_some(editor);
+            }
+        }
+        None
+    }
 }
 
 fn is_composer_name(name: &str) -> bool {
@@ -742,6 +859,36 @@ fn get_buttons(
     }
 }
 
+fn decide_web(
+    automation: &IUIAutomation,
+    request: &Request,
+    editor: &IUIAutomationElement,
+    send_or_voice: &IUIAutomationCondition,
+) -> Decision {
+    if let Action::Click { point, .. } = request.action {
+        let button = get_buttons(automation, editor, send_or_voice)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(rect, _)| contains(*rect, point));
+        match button {
+            None => return Decision::Stop,
+            Some((_, false)) => return Decision::Pass,
+            Some((_, true)) => {}
+        }
+    }
+    if let Some(prefix) = &request.confirm_prefix {
+        return if confirm_prefix(editor, request, prefix) {
+            Decision::Pass
+        } else {
+            Decision::Stop
+        };
+    }
+    draft_text(editor)
+        .ok()
+        .and_then(|draft| prefix_for_draft(&request.name, &draft.to_string()))
+        .map_or(Decision::Pass, Decision::Insert)
+}
+
 fn decide(
     automation: &IUIAutomation,
     request: &Request,
@@ -786,19 +933,6 @@ fn confirm_prefix(editor: &IUIAutomationElement, request: &Request, prefix: &str
         std::thread::sleep(Duration::from_millis(25));
     }
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_composer_name;
-
-    #[test]
-    fn recognizes_conversation_names_in_the_composer_label() {
-        assert!(is_composer_name("Digite uma mensagem para o grupo Plantão"));
-        assert!(is_composer_name("Type a message"));
-        assert!(is_composer_name("Type a message to Alex"));
-        assert!(!is_composer_name("Pesquisar mensagens"));
-    }
 }
 
 fn keyboard(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -893,5 +1027,32 @@ fn send(request: &Request) {
     }
     unsafe {
         SendInput(&inputs, size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_composer_name, is_whatsapp_web_url};
+
+    #[test]
+    fn identifies_the_loaded_whatsapp_web_origin() {
+        assert!(is_whatsapp_web_url("https://web.whatsapp.com/"));
+        assert!(is_whatsapp_web_url("https://WEB.WHATSAPP.COM/?a=b"));
+        for other in [
+            "http://web.whatsapp.com/",
+            "https://web.whatsapp.com.example.org/",
+            "https://web.whatsapp.com@example.org/",
+            "https://example.org/?page=https://web.whatsapp.com/",
+        ] {
+            assert!(!is_whatsapp_web_url(other));
+        }
+    }
+
+    #[test]
+    fn recognizes_conversation_names_in_the_composer_label() {
+        assert!(is_composer_name("Digite uma mensagem para o grupo Plantão"));
+        assert!(is_composer_name("Type a message"));
+        assert!(is_composer_name("Type a message to Alex"));
+        assert!(!is_composer_name("Pesquisar mensagens"));
     }
 }
