@@ -1,5 +1,5 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="Assinador para WhatsApp" Manufacturer="Assinador" Version="0.1.4"
+  <Package Name="Assinador para WhatsApp" Manufacturer="Assinador" Version="0.1.5"
            UpgradeCode="7F7D96B0-1B82-40F3-BD11-57F9EB4C4F30" Scope="perUser" Language="1046">
     <MajorUpgrade DowngradeErrorMessage="Já existe uma versão mais recente do Assinador instalada." />
     <MediaTemplate EmbedCab="yes" />

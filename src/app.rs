@@ -113,7 +113,7 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             scale(490),
-            scale(390),
+            scale(415),
             None,
             None,
             Some(instance),
@@ -202,6 +202,15 @@ fn run_window(background: bool) -> Result<(), Box<dyn Error>> {
             0,
             WS_VISIBLE,
             [20, 322, 430, 22],
+        )?;
+        let version = wide(concat!("Versão ", env!("CARGO_PKG_VERSION")));
+        control(
+            hwnd,
+            w!("STATIC"),
+            PCWSTR(version.as_ptr()),
+            0,
+            WS_VISIBLE,
+            [20, 350, 430, 22],
         )?;
         let signing = Signing::start()?;
         let app = App {
